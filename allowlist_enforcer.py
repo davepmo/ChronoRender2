@@ -1,279 +1,333 @@
 # allowlist_enforcer.py
 # -----------------------------------------------------------------------------
-# Chrono 9.0.1 allowlist validator (AST-based)
+# PyChrono 9.0.1 Code Gate: validate & (optionally) auto-rewrite user scripts
 #
-# What’s new in this version:
-# - Allows `import pychrono as chrono` (top-level import).
-# - Resolves top-level `pychrono.<ClassName>` to the correct submodule by
-#   looking up the class name across the allowed submodules in allowlist.json.
-#   Example: pychrono.ChBodyEasyCylinder -> pychrono.core.ChBodyEasyCylinder.
-# - Keeps strict enforcement of:
-#     * Only pychrono modules (plus SAFE_EXTRA_IMPORTS) may be imported.
-#     * Only whitelisted classes/constructors may be used.
-#     * Only methods that exist on those classes (via reflection) may be called.
-# - Produces clear, actionable error messages.
+# What it enforces:
+#   - Only classes explicitly listed in allowlist.json under pychrono.* modules
+#     may be constructed (e.g., chrono.ChBodyEasyCylinder(...)).
+#   - If overloads exist in allowlist.json, constructor arg-count must match one
+#     of the allowed windows (len(args)-defaults ... len(args)).
+#   - Non-PyChrono imports/usages are ignored (per user request).
+#   - Legacy -> current rename map is applied before validation.
+#   - A small attribute denylist blocks removed/legacy methods with suggestions
+#     (e.g., AddTypicalCamera, SetYoungModulus on NSC).
+#
+# What it DOES NOT do:
+#   - It does not attempt deep type-flow to know the runtime class behind a var.
+#     Attribute checks are name-based and conservative by design.
 #
 # Inputs:
-#   - allowlist.json with shape:
-#       {
-#         "modules": {
-#           "pychrono.core": [...class names...],
-#           "pychrono.vehicle": [...],
-#           "pychrono.irrlicht": [...],
-#           "pychrono.fea": [...]
-#         },
-#         "enums": [...],
-#         "class_methods": {},   # (optional, unused here)
-#         "overloads": {}        # (optional, for ctor arity/type checks elsewhere)
-#       }
+#   - allowlist.json: {
+#       "enums": [...],
+#       "modules": {"pychrono.core":[...], "pychrono.vehicle":[...], ...},
+#       "overloads": { "pychrono.core.ClassName":[{"args":[...],"defaults":N}, ...] }
+#     }
+#   - optional legacy_map.json: {
+#       "classes": { "OldName":"NewName", "ChLinkSpringDamper":"ChLinkTSDA", ... },
+#       "attributes": { "AddTypicalCamera":"AddCamera" }
+#     }
 #
-# Usage (CLI):
-#   python allowlist_enforcer.py your_script.py [allowlist.json]
+# Exposed API:
+#   validate_code(source:str, allowlist_path:str) -> List[str]  # errors only
+#   rewrite_and_validate(source:str, allowlist_path:str, legacy_map_path:str|None)
+#       -> (rewritten_source:str, errors:List[str], applied_renames:List[str])
 #
-# Typical server usage:
-#   from allowlist_enforcer import validate_code
-#   errs = validate_code(code_str, "allowlist.json")
-#   if errs: reject with 4xx; else proceed.
 # -----------------------------------------------------------------------------
 
-import ast
-import json
-import importlib
-from typing import Dict, List, Optional, Tuple, Set
+from __future__ import annotations
+import ast, json, os, re
+from typing import Dict, List, Tuple, Optional, Set
 
-# You may add tiny stdlib helpers you want to allow (math, time, etc.)
-SAFE_EXTRA_IMPORTS = {"math"}
+# -----------------------------
+# Small built-in legacy helpers
+# -----------------------------
+# Extend these or supply legacy_map.json next to allowlist.json.
+_BUILTIN_CLASS_RENAMES = {
+    # Example legacy → current:
+    # "ChLinkSpringDamper": "ChLinkTSDA",
+    # Add your known aliases here:
+}
+_BUILTIN_ATTR_RENAMES = {
+    # Example: Irrlicht API changes
+    # "AddTypicalCamera": "AddCamera",
+}
 
-def load_allowlist(path: str) -> dict:
+# Attribute names known to be invalid/removed in 9.0.1 or misleading in NSC:
+# (name-only check; provide human-action suggestion)
+_DENY_ATTR_WITH_HINT = {
+    "AddTypicalCamera": "Removed in 9.x. Use vis.AddCamera(pos, target) on ChVisualSystemIrrlicht.",
+    "SetYoungModulus": "Not available on ChContactMaterialNSC. Use ChContactMaterialSMC.SetYoungModulus(...) or remove for NSC.",
+}
+
+# -----------------------------
+# Helpers for reading allowlist
+# -----------------------------
+
+class Allowlist:
+    def __init__(self, data: Dict):
+        self.data = data
+        self.modules: Dict[str, Set[str]] = {
+            m: set(v) for m, v in (data.get("modules") or {}).items()
+        }
+        self.overloads: Dict[str, List[Dict]] = data.get("overloads") or {}
+
+    def is_allowed_class(self, fqname: str) -> bool:
+        # fqname like "pychrono.core.ChBodyEasyCylinder"
+        mod, _, cls = fqname.rpartition(".")
+        allowed = cls and mod in self.modules and cls in self.modules[mod]
+        return bool(allowed)
+
+    def ctor_windows(self, fqname: str) -> List[Tuple[int, int]]:
+        """Return list of (min_args, max_args) windows for ctor arg-count checks."""
+        ols = self.overloads.get(fqname, [])
+        wins: List[Tuple[int, int]] = []
+        for o in ols:
+            args = o.get("args", [])
+            defaults = int(o.get("defaults", 0))
+            n = len(args)
+            min_n = n - defaults
+            max_n = n
+            if min_n < 0:
+                min_n = 0
+            wins.append((min_n, max_n))
+        return wins
+
+
+def load_allowlist(path: str) -> Allowlist:
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
-    data.setdefault("modules", {})
-    data.setdefault("enums", [])
-    data.setdefault("class_methods", {})
-    data.setdefault("overloads", {})
-    return data
+    return Allowlist(data)
 
-def _attr_fqn(attr: ast.Attribute) -> Optional[str]:
-    """Turn an Attribute tree (e.g., pychrono.core.ChBodyEasyCylinder) into 'pychrono.core.ChBodyEasyCylinder'."""
-    parts: List[str] = []
-    cur = attr
+
+def load_legacy_map(path: Optional[str]) -> Tuple[Dict[str, str], Dict[str, str]]:
+    classes = dict(_BUILTIN_CLASS_RENAMES)
+    attrs = dict(_BUILTIN_ATTR_RENAMES)
+    if path and os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                m = json.load(f)
+            classes.update(m.get("classes", {}))
+            attrs.update(m.get("attributes", {}))
+        except Exception:
+            pass
+    return classes, attrs
+
+# -----------------------------
+# AST inspection utilities
+# -----------------------------
+
+def _is_pychrono_alias(node: ast.AST, aliases: Dict[str, str]) -> bool:
+    """Return True if node is a Name that is an alias to a pychrono.* import."""
+    return isinstance(node, ast.Name) and node.id in aliases
+
+def _attr_chain(root: ast.AST) -> List[str]:
+    """
+    Turn a.Attribute.Attribute into ["a", "Attribute", "Attribute"].
+    If not resolvable, return [].
+    """
+    out: List[str] = []
+    cur = root
     while isinstance(cur, ast.Attribute):
-        parts.append(cur.attr)
+        out.append(cur.attr)
         cur = cur.value
     if isinstance(cur, ast.Name):
-        parts.append(cur.id)
-        parts.reverse()
-        return ".".join(parts)
-    return None
+        out.append(cur.id)
+        out.reverse()
+        return out
+    return []
 
-def _call_target(func: ast.AST) -> Optional[Tuple[str, str]]:
-    """Return ('module.like.path', 'NameOrFunction') for a Call node target if attribute-based."""
-    if isinstance(func, ast.Attribute):
-        fqn = _attr_fqn(func)
-        if fqn and "." in fqn:
-            mod, name = fqn.rsplit(".", 1)
-            return mod, name
-    return None
+def _guess_module_from_alias(alias_target: str, alias_map: Dict[str, str]) -> Optional[str]:
+    """
+    Given the first identifier in a chain, see which pychrono module it belongs to.
+    alias_map: {'chrono':'pychrono.core', 'veh':'pychrono.vehicle', ...}
+    """
+    return alias_map.get(alias_target)
 
-class AllowlistValidator(ast.NodeVisitor):
-    def __init__(self, allow: dict):
-        self.errors: List[str] = []
-        self.allow = allow
-        # Map of module -> set(classnames)
-        self.allowed_modules: Dict[str, Set[str]] = {m: set(v) for m, v in allow["modules"].items()}
-        # Track variable name -> fully-qualified class name (e.g. pychrono.core.ChBodyEasyCylinder)
-        self.var_types: Dict[str, str] = {}
-        # Keep imported modules for light reflection
-        self._imports: Dict[str, object] = {}
-        self._method_cache: Dict[str, Set[str]] = {}
-
-        # Pre-import submodules listed in allowlist (best-effort).
-        for m in self.allowed_modules:
-            try:
-                self._imports[m] = importlib.import_module(m)
-            except Exception:
-                self._imports[m] = None
-
-        # Try top-level pychrono too (to support `import pychrono as chrono`)
-        try:
-            self._imports["pychrono"] = importlib.import_module("pychrono")
-        except Exception:
-            self._imports["pychrono"] = None
-
-    # -------------------------
-    # Utilities & error helper
-    # -------------------------
-    def _report(self, msg: str):
-        self.errors.append(msg)
-
-    def _resolve_top_level_class(self, cls_name: str) -> Optional[str]:
-        """If user wrote pychrono.<ClassName>, figure out which submodule owns that class.
-        Returns the submodule path (e.g., 'pychrono.core') or None if not found/ambiguous."""
-        owners = [m for m, names in self.allowed_modules.items() if cls_name in names]
-        if len(owners) == 1:
-            return owners[0]
-        # If ambiguous or not found, return None to force a clean error downstream.
+def _fqname_from_chain(chain: List[str], alias_map: Dict[str, str]) -> Optional[str]:
+    """
+    Convert something like ["chrono","ChBodyEasyCylinder"] to "pychrono.core.ChBodyEasyCylinder",
+    or ["veh","M113"] -> "pychrono.vehicle.M113".
+    """
+    if not chain:
         return None
+    base = chain[0]
+    mod = _guess_module_from_alias(base, alias_map)
+    if not mod:
+        return None
+    if len(chain) == 1:
+        return mod
+    return mod + "." + ".".join(chain[1:])
 
-    def _is_allowed_module_name(self, name: str) -> bool:
-        """Accept a submodule exactly listed in allowlist, or the top-level 'pychrono' namespace as import-only."""
-        if name == "pychrono":
-            return True
-        return any(name == m or name.startswith(m + ".") for m in self.allowed_modules)
+# -----------------------------
+# Rewriter (legacy → current)
+# -----------------------------
 
-    # -------------
-    # Import rules
-    # -------------
-    def visit_ImportFrom(self, node: ast.ImportFrom):
-        # Keep imports consistent: forbid 'from X import Y' style.
-        self._report(f"Disallowed import style: 'from {node.module} import ...'. Use plain 'import ...' only.")
+class LegacyRewriter(ast.NodeTransformer):
+    def __init__(self, class_renames: Dict[str, str], attr_renames: Dict[str, str]):
+        self.class_renames = class_renames
+        self.attr_renames = attr_renames
+        self.applied: List[str] = []
 
-    def visit_Import(self, node: ast.Import):
-        for alias in node.names:
-            name = alias.name
-            if name in SAFE_EXTRA_IMPORTS:
-                continue
-            if not name.startswith("pychrono"):
-                self._report(
-                    f"Import not allowed: '{name}'. Only 'pychrono' (top-level) and allowed pychrono submodules (plus {SAFE_EXTRA_IMPORTS}) are permitted."
-                )
-                continue
-            if not self._is_allowed_module_name(name):
-                self._report(
-                    f"Import not allowed: '{name}'. Not present in allowlist modules (allowed: top-level 'pychrono' and submodules in allowlist.json)."
-                )
-                continue
-            # Record import attempt (best-effort)
-            try:
-                self._imports[name] = importlib.import_module(name)
-            except Exception:
-                self._imports[name] = None
-
-    # -----------------------------------
-    # Assignments: track constructed type
-    # -----------------------------------
-    def visit_Assign(self, node: ast.Assign):
-        # If user is constructing e.g. x = pychrono.ChBodyEasyCylinder(...)
-        if isinstance(node.value, ast.Call):
-            target_info = _call_target(node.value.func)
-            if target_info:
-                mod, cls = target_info
-                fq_mod = mod
-
-                # If top-level pychrono, resolve to owning submodule by classname.
-                if mod == "pychrono":
-                    owner = self._resolve_top_level_class(cls)
-                    if owner is None:
-                        self._report(
-                            f"Constructor not allowed or ambiguous: {mod}.{cls}. "
-                            f"Could not resolve to a unique submodule in allowlist."
-                        )
-                    else:
-                        fq_mod = owner
-
-                # Enforce constructor validity
-                if fq_mod in self.allowed_modules and cls in self.allowed_modules[fq_mod]:
-                    fqcn = f"{fq_mod}.{cls}"
-                    for t in node.targets:
-                        if isinstance(t, ast.Name):
-                            self.var_types[t.id] = fqcn
-                elif mod.startswith("pychrono"):
-                    self._report(f"Constructor not allowed: {mod}.{cls} (not in allowlist).")
+    def visit_Attribute(self, node: ast.Attribute) -> ast.AST:
         self.generic_visit(node)
+        # Rename attribute names if needed
+        if node.attr in self.attr_renames:
+            new = self.attr_renames[node.attr]
+            if new != node.attr:
+                self.applied.append(f"attribute: {node.attr} -> {new}")
+                node.attr = new
+        return node
 
-    # ----------------------------
-    # Calls: static & instance use
-    # ----------------------------
+    def visit_Name(self, node: ast.Name) -> ast.AST:
+        # Safe to rename bare identifiers (e.g., class names in direct use)
+        if node.id in self.class_renames:
+            new = self.class_renames[node.id]
+            if new != node.id:
+                self.applied.append(f"class: {node.id} -> {new}")
+                node.id = new
+        return node
+
+# -----------------------------
+# Validator (constructors + deny attrs)
+# -----------------------------
+
+class PyChronoValidator(ast.NodeVisitor):
+    def __init__(self, allow: Allowlist, alias_map: Dict[str, str]):
+        self.allow = allow
+        self.alias_map = alias_map
+        self.errors: List[str] = []
+
     def visit_Call(self, node: ast.Call):
-        # Direct qualified calls (e.g., pychrono.ChSystem(...), pychrono.core.ChSystem(...))
-        target = _call_target(node.func)
-        if target:
-            mod, name = target
-            check_mod = mod
+        # (1) Attribute denylist by name (no deep type info; conservative)
+        if isinstance(node.func, ast.Attribute):
+            if node.func.attr in _DENY_ATTR_WITH_HINT:
+                self.errors.append(
+                    f"Use of removed/denied attribute '{node.func.attr}'. Hint: {_DENY_ATTR_WITH_HINT[node.func.attr]}"
+                )
 
-            if mod == "pychrono":
-                owner = self._resolve_top_level_class(name)
-                if owner:
-                    check_mod = owner
+        # (2) Constructor checks only for pychrono.* classes in allowlist
+        # Attempt to recover a fully-qualified name from alias + attribute chain
+        chain = _attr_chain(node.func) if isinstance(node.func, ast.Attribute) else []
+        if chain:
+            fq = _fqname_from_chain(chain, self.alias_map)
 
-            if check_mod in self.allowed_modules and name not in self.allowed_modules[check_mod]:
-                self._report(f"Call to '{mod}.{name}' is not a whitelisted constructor/class.")
-        # Instance method calls: x.SetMass(...)
-        if isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name):
-            var = node.func.value.id
-            meth = node.func.attr
-            fqcn = self.var_types.get(var)
-            if fqcn:
-                if not self._method_exists(fqcn, meth):
-                    self._report(f"Method '{meth}' not found on {fqcn}.")
-        self.generic_visit(node)
-
-    # ----------------------------
-    # Attribute access on classes
-    # ----------------------------
-    def visit_Attribute(self, node: ast.Attribute):
-        fqn = _attr_fqn(node)
-        if fqn and fqn.startswith("pychrono") and "." in fqn:
-            mod, name = fqn.rsplit(".", 1)
-
-            # If user referenced pychrono.<ClassName>, resolve to actual submodule.
-            check_mod = mod
-            if mod == "pychrono":
-                owner = self._resolve_top_level_class(name)
-                if owner:
-                    check_mod = owner
-
-            # If it *looks* like a class (PascalCase), enforce class allowlist.
-            if name and name[0].isupper():
-                if check_mod in self.allowed_modules:
-                    if name not in self.allowed_modules[check_mod]:
-                        self._report(f"Access to '{fqn}' is not allowed (class not in allowlist).")
+            # If it looks like a class ctor (module + ClassName), validate
+            if fq and fq.count(".") >= 2:
+                if not self.allow.is_allowed_class(fq):
+                    self.errors.append(f"Constructor not allowed: '{fq}'. Not in allowlist.")
                 else:
-                    # top-level class that we cannot resolve
-                    if mod == "pychrono":
-                        self._report(
-                            f"Access to '{fqn}' is not allowed; could not resolve '{name}' to an allowed submodule."
-                        )
+                    # If overloads exist, validate arg-count window
+                    wins = self.allow.ctor_windows(fq)
+                    if wins:
+                        argc = len(node.args) + sum(1 for k in node.keywords if k.arg is not None)
+                        ok = any(lo <= argc <= hi for (lo, hi) in wins)
+                        if not ok:
+                            self.errors.append(
+                                f"Constructor mismatch for {fq} with {argc} args. "
+                                f"Allowed arg windows: {wins}"
+                            )
+
         self.generic_visit(node)
 
-    # ----------------------
-    # Reflection for methods
-    # ----------------------
-    def _method_exists(self, fqcn: str, meth: str) -> bool:
-        """Light reflection: loads class and caches its dir(). If reflection fails, be lenient."""
-        if fqcn in self._method_cache:
-            return meth in self._method_cache[fqcn]
-        try:
-            mod, cls = fqcn.rsplit(".", 1)
-            m = self._imports.get(mod)
-            if not m:
-                return True  # Cannot reflect here; don't hard-fail on environments without Chrono.
-            cobj = getattr(m, cls)
-            self._method_cache[fqcn] = {n for n in dir(cobj) if not n.startswith("_")}
-            return meth in self._method_cache[fqcn]
-        except Exception:
-            return True  # Be lenient if reflection fails (runtime guard can still catch)
-        # Note: overload/arg-type checks happen in a separate runtime step.
+# -----------------------------
+# Public API
+# -----------------------------
 
-def validate_code(code: str, allowlist_path: str = "allowlist.json") -> List[str]:
-    """Validate source code against allowlist.json rules. Returns a list of error strings (empty == OK)."""
-    try:
-        tree = ast.parse(code)
-    except SyntaxError as e:
-        return [f"SyntaxError: {e}"]
+def _collect_aliases(tree: ast.AST) -> Dict[str, str]:
+    """
+    Map local aliases to exact pychrono modules:
+      import pychrono as chrono             -> {'chrono': 'pychrono.core'}  (default core)
+      import pychrono.core as chrono        -> {'chrono': 'pychrono.core'}
+      import pychrono.vehicle as veh        -> {'veh': 'pychrono.vehicle'}
+      from pychrono import vehicle as veh   -> {'veh': 'pychrono.vehicle'}
+    """
+    alias_map: Dict[str, str] = {}
 
+    class _A(ast.NodeVisitor):
+        def visit_Import(self, node: ast.Import):
+            for n in node.names:
+                if n.name == "pychrono":
+                    # Default alias points to core in end-user scripts
+                    asname = n.asname or "pychrono"
+                    alias_map[asname] = "pychrono.core"
+        def visit_ImportFrom(self, node: ast.ImportFrom):
+            if node.module == "pychrono":
+                for n in node.names:
+                    if n.name in ("core", "vehicle", "irrlicht", "fea"):
+                        asname = n.asname or n.name
+                        alias_map[asname] = f"pychrono.{n.name}"
+            elif node.module in ("pychrono.core", "pychrono.vehicle", "pychrono.irrlicht", "pychrono.fea"):
+                # from pychrono.core import something as X
+                asname = None
+                for n in node.names:
+                    asname = n.asname or n.name
+                    # These become local names; we still map to the parent module
+                    parent = node.module
+                    alias_map[asname] = parent
+
+    _A().visit(tree)
+    # Common community alias
+    if "chrono" not in alias_map:
+        # Many examples use 'import pychrono as chrono'
+        # Make a soft assumption that 'chrono' means core when used.
+        alias_map["chrono"] = "pychrono.core"
+    return alias_map
+
+
+def rewrite_and_validate(
+    source: str,
+    allowlist_path: str,
+    legacy_map_path: Optional[str] = None
+) -> Tuple[str, List[str], List[str]]:
+    """
+    (1) Apply legacy renames (classes + attributes).
+    (2) Validate ctor usage and denylisted attributes.
+    Returns: (rewritten_source, errors, applied_renames)
+    """
     allow = load_allowlist(allowlist_path)
-    v = AllowlistValidator(allow)
-    v.visit(tree)
-    return v.errors
+    cls_ren, attr_ren = load_legacy_map(legacy_map_path)
 
-if __name__ == "__main__":
-    import sys
-    if len(sys.argv) < 2:
-        print("usage: python allowlist_enforcer.py <file.py> [allowlist.json]")
-        sys.exit(2)
-    src = open(sys.argv[1], "r", encoding="utf-8").read()
-    errs = validate_code(src, sys.argv[2] if len(sys.argv) > 2 else "allowlist.json")
-    import json as _json
-    print(_json.dumps({"ok": not bool(errs), "errors": errs}, indent=2))
-    sys.exit(0 if not errs else 2)
+    # Parse
+    try:
+        tree = ast.parse(source)
+    except SyntaxError as e:
+        return source, [f"SyntaxError: {e.msg} at line {e.lineno}"], []
+
+    # Rewriting pass
+    rewriter = LegacyRewriter(cls_ren, attr_ren)
+    new_tree = rewriter.visit(tree)
+    ast.fix_missing_locations(new_tree)
+    rewritten = source
+    if rewriter.applied:
+        try:
+            import astor  # optional; nicer roundtrip if present
+            rewritten = astor.to_source(new_tree)
+        except Exception:
+            # Fallback: use built-in unparse (Py3.9+)
+            try:
+                rewritten = ast.unparse(new_tree)  # type: ignore[attr-defined]
+            except Exception:
+                # Last resort: do name-based text replacements (best-effort)
+                rewritten = source
+                for old, new in cls_ren.items():
+                    rewritten = re.sub(rf"\b{re.escape(old)}\b", new, rewritten)
+                for old, new in attr_ren.items():
+                    rewritten = re.sub(rf"\.{re.escape(old)}\b", f".{new}", rewritten)
+
+    # Validation pass
+    try:
+        tree2 = ast.parse(rewritten)
+    except SyntaxError as e:
+        return rewritten, [f"SyntaxError after rewrite: {e.msg} at line {e.lineno}"], rewriter.applied
+
+    alias_map = _collect_aliases(tree2)
+    validator = PyChronoValidator(allow, alias_map)
+    validator.visit(tree2)
+
+    return rewritten, validator.errors, rewriter.applied
+
+
+def validate_code(source: str, allowlist_path: str) -> List[str]:
+    """For servers that only want errors (no rewrite)."""
+    _rew, errs, _applied = rewrite_and_validate(source, allowlist_path, None)
+    return errs
